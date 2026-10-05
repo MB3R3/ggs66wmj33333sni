@@ -43,10 +43,104 @@ random_range() {
     echo $(( min + RANDOM % (max - min + 1) ))
 }
 
-# --- Gather input (supports --auto for past 4 months with defaults) ---
+# --- Gather input ---
+# Modes: --auto/-y (non-interactive defaults), --purge (rewrite history).
 AUTO=false
-if [[ "${1:-}" == "--auto" || "${1:-}" == "-y" ]]; then
-    AUTO=true
+PURGE=false
+DRY_RUN=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --auto|-y) AUTO=true ;;
+        --purge)   PURGE=true ;;
+        --dry-run) DRY_RUN=true ;;
+        -h|--help)
+            echo "usage: $0 [--auto|-y] [--purge] [--dry-run]"
+            exit 0 ;;
+        *)
+            echo "error: unknown argument '$arg' (try --help)"
+            exit 1 ;;
+    esac
+done
+
+if [[ "$PURGE" == true ]]; then
+    echo ""
+    echo "Purge mode: will rewrite history to drop every commit that only"
+    echo "touches fixtures/, then force-push with --force-with-lease."
+    echo ""
+    echo "  NOTE: GitHub counts contributions by commit SHA at push time."
+    echo "  Rewriting history creates NEW SHAs; the tiles you already earned"
+    echo "  stay counted and may show up as duplicates until GitHub's"
+    echo "  background indexing reconciles them (often 24-48h, sometimes never)."
+    echo "  This stops further inflation -- it does not give you a blank slate."
+    echo ""
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "Dry run: reporting only, nothing will be modified."
+        echo ""
+        echo "Commits that would be REMOVED:"
+        git log --reverse --format="%h  %ad  %s" --date=short HEAD -- fixtures/ | sed 's/^/  /'
+        echo ""
+        removed=$(git log --format="%H" HEAD -- fixtures/ | grep -c . || true)
+        kept=$(( $(git rev-list --count HEAD) - removed ))
+        echo "  $removed to remove, $kept to keep."
+        exit 0
+    fi
+
+    read -rp "Type 'purge' to proceed (anything else aborts): " confirm
+    if [[ "$confirm" != "purge" ]]; then
+        echo "aborted - nothing changed"
+        exit 0
+    fi
+
+    echo ""
+    echo "Creating safety backup branch 'backup/pre-purge'..."
+    git branch -f backup/pre-purge HEAD
+
+    echo "Removing stale refs/original from any earlier rewrite..."
+    for r in $(git for-each-ref --format="%(refname)" refs/original/); do
+        git update-ref -d "$r"
+    done
+
+    echo "Rewriting history (this takes a moment)..."
+    # Every fake commit adds only empty files under fixtures/. Dropping that
+    # path empties those commits, and --prune-empty drops them entirely,
+    # leaving real commits untouched.
+    FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch --force \
+        --index-filter "git rm -q -r --cached --ignore-unmatch fixtures" \
+        --prune-empty \
+        --tag-name-filter cat \
+        -- main
+
+    echo "Cleaning up rewrite metadata and unreachable objects..."
+    for r in $(git for-each-ref --format="%(refname)" refs/original/); do
+        git update-ref -d "$r"
+    done
+    rm -rf .git/refs/original
+    git reflog expire --expire=now --all
+    git gc --prune=now --quiet
+
+    echo ""
+    echo "History rewritten. Remaining commits:"
+    git log --oneline --reverse
+    echo ""
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo "error: working tree not clean after rewrite; refusing to push."
+        echo "       resolve manually, then: git push --force-with-lease origin main"
+        exit 1
+    fi
+
+    echo "Force-pushing to origin/main..."
+    if git push --force-with-lease origin main; then
+        echo "Done. Restore old history with: git reset --hard backup/pre-purge"
+    else
+        echo ""
+        echo "Push rejected. --force-with-lease refused because origin/main moved"
+        echo "since your last fetch. Fetch and inspect before retrying:"
+        echo "  git fetch origin && git log --oneline origin/main"
+    fi
+    exit 0
 fi
 
 if [[ "$AUTO" == true ]]; then
